@@ -23,9 +23,11 @@ const PropertiesPanel = lazy(() =>
 
 const LEGACY_STORAGE_KEY = 'nebula-draft.scene.v1';
 const PASTE_OFFSET = 26;
+const AUTO_SAVE_DELAY_MS = 1200;
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
 type SaveMessageType = 'info' | 'success' | 'error';
+type SaveSource = 'manual' | 'auto';
 
 interface SaveMessage {
   id: number;
@@ -61,7 +63,10 @@ function App() {
   const latestPresentRef = useRef(present);
   const saveStatusTimerRef = useRef<number | null>(null);
   const saveMessageTimerRef = useRef<number | null>(null);
+  const autoSaveTimerRef = useRef<number | null>(null);
   const isSavingRef = useRef(false);
+  const hasRestoredRef = useRef(false);
+  const pendingSaveSourceRef = useRef<SaveSource | null>(null);
 
   const elementById = useMemo(
     () => new Map(present.elements.map((element) => [element.id, element] as const)),
@@ -190,39 +195,68 @@ function App() {
     [],
   );
 
-  const handleSave = useCallback(async () => {
-    if (isSavingRef.current) {
-      showSaveMessage('正在保存中，请稍候...', 'info', 1200);
-      return;
-    }
+  const performSave = useCallback(
+    async (source: SaveSource) => {
+      if (isSavingRef.current) {
+        pendingSaveSourceRef.current =
+          source === 'manual' || pendingSaveSourceRef.current === 'manual' ? 'manual' : 'auto';
 
-    isSavingRef.current = true;
+        if (source === 'manual') {
+          showSaveMessage('正在保存中，请稍候...', 'info', 1200);
+        }
+        return;
+      }
 
-    if (saveStatusTimerRef.current !== null) {
-      window.clearTimeout(saveStatusTimerRef.current);
-      saveStatusTimerRef.current = null;
-    }
+      isSavingRef.current = true;
 
-    setSaveStatus('saving');
-    showSaveMessage('正在保存...', 'info', 0);
-
-    try {
-      await savePresentStateToIndexedDB(latestPresentRef.current);
-      setSaveStatus('saved');
-      showSaveMessage('已保存到 IndexedDB', 'success', 1800);
-
-      saveStatusTimerRef.current = window.setTimeout(() => {
-        setSaveStatus('idle');
+      if (saveStatusTimerRef.current !== null) {
+        window.clearTimeout(saveStatusTimerRef.current);
         saveStatusTimerRef.current = null;
-      }, 1800);
-    } catch (error) {
-      console.error('Failed to save scene to IndexedDB.', error);
-      setSaveStatus('error');
-      showSaveMessage('保存失败，请重试', 'error', 2200);
-    } finally {
-      isSavingRef.current = false;
-    }
-  }, [showSaveMessage]);
+      }
+
+      setSaveStatus('saving');
+      if (source === 'manual') {
+        showSaveMessage('正在保存...', 'info', 0);
+      }
+
+      try {
+        await savePresentStateToIndexedDB(latestPresentRef.current);
+
+        if (source === 'manual') {
+          setSaveStatus('saved');
+          showSaveMessage('已保存到 IndexedDB', 'success', 1800);
+
+          saveStatusTimerRef.current = window.setTimeout(() => {
+            setSaveStatus('idle');
+            saveStatusTimerRef.current = null;
+          }, 1800);
+        } else {
+          setSaveStatus('idle');
+        }
+      } catch (error) {
+        console.error('Failed to save scene to IndexedDB.', error);
+        setSaveStatus('error');
+        showSaveMessage(
+          source === 'manual' ? '保存失败，请重试' : '自动保存失败，请稍后手动保存',
+          'error',
+          2200,
+        );
+      } finally {
+        isSavingRef.current = false;
+
+        const queuedSource = pendingSaveSourceRef.current;
+        pendingSaveSourceRef.current = null;
+        if (queuedSource) {
+          void performSave(queuedSource);
+        }
+      }
+    },
+    [showSaveMessage],
+  );
+
+  const handleSave = useCallback(() => {
+    void performSave('manual');
+  }, [performSave]);
 
   useHotkeys({
     dispatch,
@@ -241,31 +275,60 @@ function App() {
   }, [present]);
 
   useEffect(() => {
+    if (!hasRestoredRef.current) {
+      return;
+    }
+
+    if (autoSaveTimerRef.current !== null) {
+      window.clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+
+    autoSaveTimerRef.current = window.setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      void performSave('auto');
+    }, AUTO_SAVE_DELAY_MS);
+
+    return () => {
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
+    };
+  }, [performSave, present]);
+
+  useEffect(() => {
     let disposed = false;
 
     const restore = async () => {
-      const restored = await loadPresentStateFromIndexedDB();
-      if (disposed) {
-        return;
-      }
-
-      if (restored) {
-        dispatch({ type: 'hydrate', state: restored });
-        return;
-      }
-
-      const legacy = parsePresentState(localStorage.getItem(LEGACY_STORAGE_KEY));
-      if (!legacy) {
-        return;
-      }
-
-      dispatch({ type: 'hydrate', state: legacy });
-
       try {
-        await savePresentStateToIndexedDB(legacy);
-        localStorage.removeItem(LEGACY_STORAGE_KEY);
-      } catch (error) {
-        console.warn('Failed to migrate localStorage scene into IndexedDB.', error);
+        const restored = await loadPresentStateFromIndexedDB();
+        if (disposed) {
+          return;
+        }
+
+        if (restored) {
+          dispatch({ type: 'hydrate', state: restored });
+          return;
+        }
+
+        const legacy = parsePresentState(localStorage.getItem(LEGACY_STORAGE_KEY));
+        if (!legacy) {
+          return;
+        }
+
+        dispatch({ type: 'hydrate', state: legacy });
+
+        try {
+          await savePresentStateToIndexedDB(legacy);
+          localStorage.removeItem(LEGACY_STORAGE_KEY);
+        } catch (error) {
+          console.warn('Failed to migrate localStorage scene into IndexedDB.', error);
+        }
+      } finally {
+        if (!disposed) {
+          hasRestoredRef.current = true;
+        }
       }
     };
 
@@ -284,6 +347,10 @@ function App() {
 
       if (saveMessageTimerRef.current !== null) {
         window.clearTimeout(saveMessageTimerRef.current);
+      }
+
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
       }
     };
   }, []);
