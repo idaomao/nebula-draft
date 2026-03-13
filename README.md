@@ -15,7 +15,7 @@ Nebula Draft 是一个基于 React + TypeScript 的轻量图形编辑器。
 - 属性面板编辑（位置、尺寸、颜色、描边）
 - 多选统一改样式
 - 撤销 / 重做
-- 本地持久化（indexDB）
+- 本地持久化（IndexedDB，含自动保存）
 - 快捷键
 
 ## 快捷键
