@@ -64,3 +64,7 @@ src/
     editor.ts
   App.tsx
 ```
+
+## 架构文档
+
+- Canvas 与 DOM 职责边界: [docs/canvas-dom-responsibilities.md](docs/canvas-dom-responsibilities.md)

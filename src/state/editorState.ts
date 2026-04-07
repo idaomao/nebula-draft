@@ -265,6 +265,7 @@ export type EditorAction =
   | { type: 'set-tool'; tool: Tool }
   | { type: 'set-grid-snap'; enabled: boolean }
   | { type: 'set-selection'; ids: string[] }
+  | { type: 'bring-to-front'; ids: string[]; trackHistory?: boolean }
   | { type: 'clear-selection' }
   | { type: 'add-element'; element: BoardElement }
   | { type: 'add-elements'; elements: BoardElement[] }
@@ -303,6 +304,42 @@ export const editorReducer = (state: EditorHistoryState, action: EditorAction): 
         ...present,
         selectedIds: normalizeSelection(present.elements, action.ids),
       }));
+
+    case 'bring-to-front': {
+      if (action.ids.length === 0) {
+        return state;
+      }
+
+      const nextPresent = clonePresent(state.present);
+      const existingIdSet = new Set(nextPresent.elements.map((element) => element.id));
+      const targetIds = action.ids.filter((id) => existingIdSet.has(id));
+
+      if (targetIds.length === 0) {
+        return state;
+      }
+
+      const targetIdSet = new Set(targetIds);
+      const keepElements = nextPresent.elements.filter((element) => !targetIdSet.has(element.id));
+      const frontElements = nextPresent.elements.filter((element) => targetIdSet.has(element.id));
+
+      const reordered = [...keepElements, ...frontElements];
+      const hasChanged = reordered.some((element, index) => element.id !== nextPresent.elements[index]?.id);
+
+      if (!hasChanged) {
+        return state;
+      }
+
+      nextPresent.elements = reordered;
+
+      if (action.trackHistory === false) {
+        return {
+          ...state,
+          present: nextPresent,
+        };
+      }
+
+      return commit(state, nextPresent);
+    }
 
     case 'clear-selection':
       return updatePresentOnly(state, (present) => ({

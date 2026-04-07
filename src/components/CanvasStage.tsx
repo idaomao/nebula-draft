@@ -1,19 +1,23 @@
 import {
   useEffect,
+  memo,
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
+  type MutableRefObject,
   type ChangeEvent,
   type FocusEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import type Konva from 'konva';
 import type { KonvaEventObject } from 'konva/lib/Node';
-import { Ellipse, Group, Image as KonvaImage, Layer, Line, Rect, Stage, Transformer } from 'react-konva';
+import { Ellipse, Group, Image as KonvaImage, Layer, Line, Rect, Stage, Text as KonvaText, Transformer } from 'react-konva';
 import { useStageSize } from '../hooks/useStageSize';
 import type { BoardElement, ElementGroup, ImageElement, Tool, ViewportState } from '../types/editor';
+import type { CanvasBridgeMetrics, CanvasRenderCommand } from '../types/architecture';
+import { useSceneRenderModel } from '../renderer/sceneRenderModel';
 import {
+  getNoteDisplayText,
   normalizeRichText,
   plainTextToRichText,
   richTextToPlainText,
@@ -39,17 +43,12 @@ interface DragSession {
 interface ActiveElementDragSession {
   session: DragSession;
   moved: boolean;
+  elevated: boolean;
 }
 
 interface ElementPatchUpdate {
   id: string;
   patch: Partial<BoardElement>;
-}
-
-interface NoteDisplayItem {
-  id: string;
-  html: string;
-  style: CSSProperties;
 }
 
 interface CanvasStageProps {
@@ -58,12 +57,15 @@ interface CanvasStageProps {
   selectedIds: string[];
   tool: Tool;
   gridSnapEnabled: boolean;
+  renderCommands: CanvasRenderCommand[];
+  bridgeMetrics: CanvasBridgeMetrics;
   imageInsertVersion: number;
   viewport: ViewportState;
   onSelectionChange: (ids: string[]) => void;
   onAddElement: (element: BoardElement) => void;
   onPatchElement: (id: string, patch: Partial<BoardElement>, trackHistory?: boolean) => void;
   onPatchElements: (updates: ElementPatchUpdate[], trackHistory?: boolean) => void;
+  onBringToFront: (ids: string[], trackHistory?: boolean) => void;
   onViewportChange: (viewport: Partial<ViewportState>) => void;
 }
 
@@ -185,6 +187,126 @@ const CanvasImageNode = ({ element }: { element: ImageElement }) => {
     </>
   );
 };
+
+interface ElementNodeHandlers {
+  onPointerDown: (
+    event: KonvaEventObject<MouseEvent | TouchEvent>,
+    id: string,
+    currentTool: Tool,
+  ) => void;
+  onTransformEnd: (event: KonvaEventObject<Event>, element: BoardElement) => void;
+  onDoubleClick: (element: BoardElement) => void;
+}
+
+interface ElementNodeProps {
+  element: BoardElement;
+  tool: Tool;
+  setNodeRef: (id: string, node: Konva.Group | null) => void;
+  handlersRef: MutableRefObject<ElementNodeHandlers>;
+}
+
+const ElementNode = memo(
+  ({ element, tool, setNodeRef, handlersRef }: ElementNodeProps) => {
+    return (
+      <Group
+        key={element.id}
+        id={element.id}
+        x={element.x}
+        y={element.y}
+        rotation={element.rotation}
+        ref={(node) => setNodeRef(element.id, node)}
+        draggable={false}
+        onMouseDown={(event) => handlersRef.current.onPointerDown(event, element.id, tool)}
+        onTouchStart={(event) => handlersRef.current.onPointerDown(event, element.id, tool)}
+        onTransformEnd={(event) => handlersRef.current.onTransformEnd(event, element)}
+        onDblClick={() => handlersRef.current.onDoubleClick(element)}
+        onDblTap={() => handlersRef.current.onDoubleClick(element)}
+      >
+        {element.kind === 'rect' ? (
+          <Rect
+            width={element.width}
+            height={element.height}
+            fill={element.fill}
+            stroke={element.stroke}
+            strokeWidth={element.strokeWidth}
+            cornerRadius={8}
+          />
+        ) : null}
+
+        {element.kind === 'ellipse' ? (
+          <Ellipse
+            x={element.width / 2}
+            y={element.height / 2}
+            radiusX={element.width / 2}
+            radiusY={element.height / 2}
+            fill={element.fill}
+            stroke={element.stroke}
+            strokeWidth={element.strokeWidth}
+          />
+        ) : null}
+
+        {element.kind === 'triangle' ? (
+          <Line
+            points={[element.width / 2, 0, element.width, element.height, 0, element.height]}
+            closed
+            fill={element.fill}
+            stroke={element.stroke}
+            strokeWidth={element.strokeWidth}
+            lineJoin="round"
+          />
+        ) : null}
+
+        {element.kind === 'diamond' ? (
+          <Line
+            points={[
+              element.width / 2,
+              0,
+              element.width,
+              element.height / 2,
+              element.width / 2,
+              element.height,
+              0,
+              element.height / 2,
+            ]}
+            closed
+            fill={element.fill}
+            stroke={element.stroke}
+            strokeWidth={element.strokeWidth}
+            lineJoin="round"
+          />
+        ) : null}
+
+        {element.kind === 'image' ? <CanvasImageNode element={element} /> : null}
+
+        {element.kind === 'note' ? (
+          <>
+            <Rect
+              width={element.width}
+              height={element.height}
+              fill={element.fill}
+              stroke={element.stroke}
+              strokeWidth={element.strokeWidth}
+              cornerRadius={10}
+            />
+            <KonvaText
+              x={12}
+              y={10}
+              width={Math.max(0, element.width - 24)}
+              height={Math.max(0, element.height - 20)}
+              text={getNoteDisplayText(element.text, element.richText)}
+              fontSize={element.fontSize}
+              fill={element.textColor}
+              lineHeight={1.35}
+              wrap="word"
+              listening={false}
+            />
+          </>
+        ) : null}
+      </Group>
+    );
+  },
+  (prev, next) => prev.element === next.element && prev.tool === next.tool,
+);
 
 const intersectsBounds = (
   first: { x: number; y: number; width: number; height: number },
@@ -316,12 +438,15 @@ export const CanvasStage = ({
   selectedIds,
   tool,
   gridSnapEnabled,
+  renderCommands,
+  bridgeMetrics,
   imageInsertVersion,
   viewport,
   onSelectionChange,
   onAddElement,
   onPatchElement,
   onPatchElements,
+  onBringToFront,
   onViewportChange,
 }: CanvasStageProps) => {
   const { containerRef, size } = useStageSize<HTMLDivElement>();
@@ -342,11 +467,17 @@ export const CanvasStage = ({
   const [marqueeCurrent, setMarqueeCurrent] = useState<Point | null>(null);
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
+  const elementNodeHandlersRef = useRef<ElementNodeHandlers>({
+    onPointerDown: () => undefined,
+    onTransformEnd: () => undefined,
+    onDoubleClick: () => undefined,
+  });
+  const renderElements = useSceneRenderModel(elements, renderCommands);
 
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const elementsById = useMemo(
-    () => new Map(elements.map((element) => [element.id, element] as const)),
-    [elements],
+    () => new Map(renderElements.map((element) => [element.id, element] as const)),
+    [renderElements],
   );
   const groupsById = useMemo(() => new Map(groups.map((group) => [group.id, group] as const)), [groups]);
   const editingNote = useMemo(() => {
@@ -370,31 +501,6 @@ export const CanvasStage = ({
       minHeight: Math.max(120, editingNote.height * viewport.scale),
     };
   }, [editingNote, viewport.scale, viewport.x, viewport.y]);
-
-  const noteDisplayItems = useMemo<NoteDisplayItem[]>(() => {
-    return elements
-      .filter((element): element is BoardElement & { kind: 'note' } => element.kind === 'note')
-      .filter((note) => note.id !== editingNoteId)
-      .map((note) => {
-        const contentLeft = (note.x + 12) * viewport.scale + viewport.x;
-        const contentTop = (note.y + 10) * viewport.scale + viewport.y;
-
-        return {
-          id: note.id,
-          html: normalizeRichText(note.richText),
-          style: {
-            left: contentLeft,
-            top: contentTop,
-            width: Math.max(0, note.width - 24) * viewport.scale,
-            height: Math.max(0, note.height - 20) * viewport.scale,
-            fontSize: Math.max(10, note.fontSize * viewport.scale),
-            color: note.textColor,
-            transform: `rotate(${note.rotation}deg)`,
-            transformOrigin: 'top left',
-          },
-        };
-      });
-  }, [editingNoteId, elements, viewport.scale, viewport.x, viewport.y]);
 
   const draftBounds = useMemo(() => {
     if (!drawingStart || !drawingCurrent) {
@@ -424,7 +530,7 @@ export const CanvasStage = ({
     }
 
     transformer.getLayer()?.batchDraw();
-  }, [elements, selectedIds]);
+  }, [renderElements, selectedIds]);
 
   useEffect(() => {
     if (imageInsertVersion <= 0 || imageInsertVersion === lastImageInsertVersionRef.current) {
@@ -633,6 +739,7 @@ export const CanvasStage = ({
     activeElementDragRef.current = {
       session,
       moved: false,
+      elevated: false,
     };
   };
 
@@ -766,8 +873,8 @@ export const CanvasStage = ({
         fill: '#fef4d6',
         stroke: '#9b8a35',
         strokeWidth: 1.5,
-        text: '双击编辑文本',
-        richText: plainTextToRichText('双击编辑文本'),
+        text: '在属性面板中编辑富文本',
+        richText: plainTextToRichText('在属性面板中编辑富文本'),
         fontSize: 18,
         textColor: '#3a3416',
       });
@@ -819,6 +926,10 @@ export const CanvasStage = ({
       }
 
       activeDrag.moved = true;
+      if (!activeDrag.elevated) {
+        onBringToFront(Array.from(activeDrag.session.basePositions.keys()), false);
+        activeDrag.elevated = true;
+      }
       runDragSession(activeDrag.session, worldPoint, false);
       return;
     }
@@ -859,7 +970,7 @@ export const CanvasStage = ({
         return;
       }
 
-      const hits = elements
+      const hits = renderElements
         .filter((element) => intersectsBounds(bounds, getElementBounds(element)))
         .flatMap((element) => {
           if (!element.groupId) {
@@ -986,6 +1097,12 @@ export const CanvasStage = ({
     setEditingNoteId(element.id);
   };
 
+  elementNodeHandlersRef.current = {
+    onPointerDown: handleElementPointerDown,
+    onTransformEnd: handleElementTransformEnd,
+    onDoubleClick: handleElementDoubleClick,
+  };
+
   const handleWheel = (event: KonvaEventObject<WheelEvent>) => {
     event.evt.preventDefault();
 
@@ -1055,91 +1172,15 @@ export const CanvasStage = ({
         onWheel={handleWheel}
       >
         <Layer>
-          {elements.map((element) => {
+          {renderElements.map((element) => {
             return (
-              <Group
+              <ElementNode
                 key={element.id}
-                id={element.id}
-                x={element.x}
-                y={element.y}
-                rotation={element.rotation}
-                ref={(node) => setNodeRef(element.id, node)}
-                draggable={false}
-                onMouseDown={(event) => handleElementPointerDown(event, element.id, tool)}
-                onTouchStart={(event) => handleElementPointerDown(event, element.id, tool)}
-                onTransformEnd={(event) => handleElementTransformEnd(event, element)}
-                onDblClick={() => handleElementDoubleClick(element)}
-                onDblTap={() => handleElementDoubleClick(element)}
-              >
-                {element.kind === 'rect' ? (
-                  <Rect
-                    width={element.width}
-                    height={element.height}
-                    fill={element.fill}
-                    stroke={element.stroke}
-                    strokeWidth={element.strokeWidth}
-                    cornerRadius={8}
-                  />
-                ) : null}
-
-                {element.kind === 'ellipse' ? (
-                  <Ellipse
-                    x={element.width / 2}
-                    y={element.height / 2}
-                    radiusX={element.width / 2}
-                    radiusY={element.height / 2}
-                    fill={element.fill}
-                    stroke={element.stroke}
-                    strokeWidth={element.strokeWidth}
-                  />
-                ) : null}
-
-                {element.kind === 'triangle' ? (
-                  <Line
-                    points={[element.width / 2, 0, element.width, element.height, 0, element.height]}
-                    closed
-                    fill={element.fill}
-                    stroke={element.stroke}
-                    strokeWidth={element.strokeWidth}
-                    lineJoin="round"
-                  />
-                ) : null}
-
-                {element.kind === 'diamond' ? (
-                  <Line
-                    points={[
-                      element.width / 2,
-                      0,
-                      element.width,
-                      element.height / 2,
-                      element.width / 2,
-                      element.height,
-                      0,
-                      element.height / 2,
-                    ]}
-                    closed
-                    fill={element.fill}
-                    stroke={element.stroke}
-                    strokeWidth={element.strokeWidth}
-                    lineJoin="round"
-                  />
-                ) : null}
-
-                {element.kind === 'image' ? <CanvasImageNode element={element} /> : null}
-
-                {element.kind === 'note' ? (
-                  <>
-                    <Rect
-                      width={element.width}
-                      height={element.height}
-                      fill={element.fill}
-                      stroke={element.stroke}
-                      strokeWidth={element.strokeWidth}
-                      cornerRadius={10}
-                    />
-                  </>
-                ) : null}
-              </Group>
+                element={element}
+                tool={tool}
+                setNodeRef={setNodeRef}
+                handlersRef={elementNodeHandlersRef}
+              />
             );
           })}
 
@@ -1282,17 +1323,6 @@ export const CanvasStage = ({
         onChange={handleImageUploadChange}
       />
 
-      <div className="note-rich-layer" aria-hidden>
-        {noteDisplayItems.map((note) => (
-          <div
-            key={note.id}
-            className="note-rich-content"
-            style={note.style}
-            dangerouslySetInnerHTML={{ __html: note.html }}
-          />
-        ))}
-      </div>
-
       {editingNote && editingNoteStyle ? (
         <div className="note-inline-editor" ref={inlineEditorRootRef} style={editingNoteStyle}>
           <div className="note-inline-toolbar">
@@ -1405,11 +1435,15 @@ export const CanvasStage = ({
         <span>
           工具: {tool} | 选择模式拖动对象，平移工具拖动画布，Ctrl/Meta + 滚轮缩放，滚轮平移，拖拽吸附（网格 {gridSnapEnabled ? '开' : '关'}，G 切换），I 或图片按钮直接插图
         </span>
+        <span>
+          Bridge: {bridgeMetrics.commandCount} cmds（+{bridgeMetrics.createCount} / ~{bridgeMetrics.updateCount} / -{bridgeMetrics.deleteCount}） | reconcile {bridgeMetrics.reconcileMs.toFixed(2)}ms / avg {bridgeMetrics.averageReconcileMs.toFixed(2)}ms / max {bridgeMetrics.maxReconcileMs.toFixed(2)}ms
+        </span>
       </div>
 
       <Minimap
-        elements={elements}
+        elements={renderElements}
         selectedIds={selectedIds}
+        renderCommands={renderCommands}
         viewport={viewport}
         stageSize={size}
         onViewportChange={onViewportChange}

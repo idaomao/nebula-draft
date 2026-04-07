@@ -1,11 +1,9 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Toolbar } from './components/Toolbar';
+import { useCanvasBridge } from './bridge/useCanvasBridge';
 import { useHotkeys } from './hooks/useHotkeys';
-import {
-  editorReducer,
-  initialHistoryState,
-  parsePresentState,
-} from './state/editorState';
+import { parsePresentState } from './state/editorState';
+import { useEditorStore } from './state/editorStore';
 import {
   loadPresentStateFromIndexedDB,
   savePresentStateToIndexedDB,
@@ -23,11 +21,9 @@ const PropertiesPanel = lazy(() =>
 
 const LEGACY_STORAGE_KEY = 'nebula-draft.scene.v1';
 const PASTE_OFFSET = 26;
-const AUTO_SAVE_DELAY_MS = 1200;
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
 type SaveMessageType = 'info' | 'success' | 'error';
-type SaveSource = 'manual' | 'auto';
 
 interface SaveMessage {
   id: number;
@@ -52,7 +48,8 @@ interface ClipboardSnapshot {
 }
 
 function App() {
-  const [history, dispatch] = useReducer(editorReducer, initialHistoryState);
+  const history = useEditorStore((state) => state.history);
+  const dispatch = useEditorStore((state) => state.dispatch);
   const [canPaste, setCanPaste] = useState(false);
   const [imageInsertVersion, setImageInsertVersion] = useState(0);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
@@ -60,25 +57,22 @@ function App() {
   const clipboardRef = useRef<ClipboardSnapshot | null>(null);
   const pasteCountRef = useRef(0);
   const { past, present, future } = history;
+  const bridgeFrame = useCanvasBridge(present);
+  const bridgeSnapshot = bridgeFrame.snapshot;
+  const view = bridgeSnapshot.present;
   const latestPresentRef = useRef(present);
   const saveStatusTimerRef = useRef<number | null>(null);
   const saveMessageTimerRef = useRef<number | null>(null);
-  const autoSaveTimerRef = useRef<number | null>(null);
   const isSavingRef = useRef(false);
-  const hasRestoredRef = useRef(false);
-  const pendingSaveSourceRef = useRef<SaveSource | null>(null);
 
-  const elementById = useMemo(
-    () => new Map(present.elements.map((element) => [element.id, element] as const)),
-    [present.elements],
-  );
+  const elementById = bridgeSnapshot.elementById;
 
   const selectedElements = useMemo(
     () =>
-      present.selectedIds
+      view.selectedIds
         .map((id) => elementById.get(id))
         .filter((element): element is BoardElement => Boolean(element)),
-    [elementById, present.selectedIds],
+    [elementById, view.selectedIds],
   );
 
   const handleCopy = useCallback(() => {
@@ -93,7 +87,7 @@ function App() {
         ...cloneElement(element),
         groupId: null,
       })),
-      groups: present.groups
+      groups: view.groups
         .map((group) => ({
           ...group,
           childIds: group.childIds.filter((id) => selectedIdSet.has(id)),
@@ -108,7 +102,7 @@ function App() {
 
     pasteCountRef.current = 0;
     setCanPaste(true);
-  }, [present.groups, selectedElements]);
+  }, [selectedElements, view.groups]);
 
   const handlePaste = useCallback(() => {
     const snapshot = clipboardRef.current;
@@ -147,7 +141,7 @@ function App() {
   }, []);
 
   const handleGroup = useCallback(() => {
-    if (present.selectedIds.length < 2) {
+    if (view.selectedIds.length < 2) {
       return;
     }
 
@@ -155,19 +149,19 @@ function App() {
       type: 'group-selected',
       groupId: createId('group'),
     });
-  }, [present.selectedIds.length]);
+  }, [view.selectedIds.length]);
 
   const handleUngroup = useCallback(() => {
     dispatch({ type: 'ungroup-selected' });
   }, []);
 
   const handleToggleGridSnap = useCallback(() => {
-    dispatch({ type: 'set-grid-snap', enabled: !present.gridSnapEnabled });
-  }, [present.gridSnapEnabled]);
+    dispatch({ type: 'set-grid-snap', enabled: !view.gridSnapEnabled });
+  }, [view.gridSnapEnabled]);
 
   const handleSelectAll = useCallback(() => {
-    dispatch({ type: 'set-selection', ids: present.elements.map((element) => element.id) });
-  }, [present.elements]);
+    dispatch({ type: 'set-selection', ids: view.elements.map((element) => element.id) });
+  }, [view.elements]);
 
   const handleInsertImage = useCallback(() => {
     setImageInsertVersion((value) => value + 1);
@@ -195,68 +189,39 @@ function App() {
     [],
   );
 
-  const performSave = useCallback(
-    async (source: SaveSource) => {
-      if (isSavingRef.current) {
-        pendingSaveSourceRef.current =
-          source === 'manual' || pendingSaveSourceRef.current === 'manual' ? 'manual' : 'auto';
+  const handleSave = useCallback(async () => {
+    if (isSavingRef.current) {
+      showSaveMessage('正在保存中，请稍候...', 'info', 1200);
+      return;
+    }
 
-        if (source === 'manual') {
-          showSaveMessage('正在保存中，请稍候...', 'info', 1200);
-        }
-        return;
-      }
+    isSavingRef.current = true;
 
-      isSavingRef.current = true;
+    if (saveStatusTimerRef.current !== null) {
+      window.clearTimeout(saveStatusTimerRef.current);
+      saveStatusTimerRef.current = null;
+    }
 
-      if (saveStatusTimerRef.current !== null) {
-        window.clearTimeout(saveStatusTimerRef.current);
+    setSaveStatus('saving');
+    showSaveMessage('正在保存...', 'info', 0);
+
+    try {
+      await savePresentStateToIndexedDB(latestPresentRef.current);
+      setSaveStatus('saved');
+      showSaveMessage('已保存到 IndexedDB', 'success', 1800);
+
+      saveStatusTimerRef.current = window.setTimeout(() => {
+        setSaveStatus('idle');
         saveStatusTimerRef.current = null;
-      }
-
-      setSaveStatus('saving');
-      if (source === 'manual') {
-        showSaveMessage('正在保存...', 'info', 0);
-      }
-
-      try {
-        await savePresentStateToIndexedDB(latestPresentRef.current);
-
-        if (source === 'manual') {
-          setSaveStatus('saved');
-          showSaveMessage('已保存到 IndexedDB', 'success', 1800);
-
-          saveStatusTimerRef.current = window.setTimeout(() => {
-            setSaveStatus('idle');
-            saveStatusTimerRef.current = null;
-          }, 1800);
-        } else {
-          setSaveStatus('idle');
-        }
-      } catch (error) {
-        console.error('Failed to save scene to IndexedDB.', error);
-        setSaveStatus('error');
-        showSaveMessage(
-          source === 'manual' ? '保存失败，请重试' : '自动保存失败，请稍后手动保存',
-          'error',
-          2200,
-        );
-      } finally {
-        isSavingRef.current = false;
-
-        const queuedSource = pendingSaveSourceRef.current;
-        pendingSaveSourceRef.current = null;
-        if (queuedSource) {
-          void performSave(queuedSource);
-        }
-      }
-    },
-    [showSaveMessage],
-  );
-
-  const handleSave = useCallback(() => {
-    void performSave('manual');
-  }, [performSave]);
+      }, 1800);
+    } catch (error) {
+      console.error('Failed to save scene to IndexedDB.', error);
+      setSaveStatus('error');
+      showSaveMessage('保存失败，请重试', 'error', 2200);
+    } finally {
+      isSavingRef.current = false;
+    }
+  }, [showSaveMessage]);
 
   useHotkeys({
     dispatch,
@@ -271,64 +236,35 @@ function App() {
   });
 
   useEffect(() => {
-    latestPresentRef.current = present;
-  }, [present]);
-
-  useEffect(() => {
-    if (!hasRestoredRef.current) {
-      return;
-    }
-
-    if (autoSaveTimerRef.current !== null) {
-      window.clearTimeout(autoSaveTimerRef.current);
-      autoSaveTimerRef.current = null;
-    }
-
-    autoSaveTimerRef.current = window.setTimeout(() => {
-      autoSaveTimerRef.current = null;
-      void performSave('auto');
-    }, AUTO_SAVE_DELAY_MS);
-
-    return () => {
-      if (autoSaveTimerRef.current !== null) {
-        window.clearTimeout(autoSaveTimerRef.current);
-        autoSaveTimerRef.current = null;
-      }
-    };
-  }, [performSave, present]);
+    latestPresentRef.current = view;
+  }, [view]);
 
   useEffect(() => {
     let disposed = false;
 
     const restore = async () => {
+      const restored = await loadPresentStateFromIndexedDB();
+      if (disposed) {
+        return;
+      }
+
+      if (restored) {
+        dispatch({ type: 'hydrate', state: restored });
+        return;
+      }
+
+      const legacy = parsePresentState(localStorage.getItem(LEGACY_STORAGE_KEY));
+      if (!legacy) {
+        return;
+      }
+
+      dispatch({ type: 'hydrate', state: legacy });
+
       try {
-        const restored = await loadPresentStateFromIndexedDB();
-        if (disposed) {
-          return;
-        }
-
-        if (restored) {
-          dispatch({ type: 'hydrate', state: restored });
-          return;
-        }
-
-        const legacy = parsePresentState(localStorage.getItem(LEGACY_STORAGE_KEY));
-        if (!legacy) {
-          return;
-        }
-
-        dispatch({ type: 'hydrate', state: legacy });
-
-        try {
-          await savePresentStateToIndexedDB(legacy);
-          localStorage.removeItem(LEGACY_STORAGE_KEY);
-        } catch (error) {
-          console.warn('Failed to migrate localStorage scene into IndexedDB.', error);
-        }
-      } finally {
-        if (!disposed) {
-          hasRestoredRef.current = true;
-        }
+        await savePresentStateToIndexedDB(legacy);
+        localStorage.removeItem(LEGACY_STORAGE_KEY);
+      } catch (error) {
+        console.warn('Failed to migrate localStorage scene into IndexedDB.', error);
       }
     };
 
@@ -348,10 +284,6 @@ function App() {
       if (saveMessageTimerRef.current !== null) {
         window.clearTimeout(saveMessageTimerRef.current);
       }
-
-      if (autoSaveTimerRef.current !== null) {
-        window.clearTimeout(autoSaveTimerRef.current);
-      }
     };
   }, []);
 
@@ -363,7 +295,7 @@ function App() {
     return selectedElements[0];
   }, [selectedElements]);
 
-  const canGroup = present.selectedIds.length >= 2;
+  const canGroup = view.selectedIds.length >= 2;
   const canUngroup = selectedElements.some((element) => typeof element.groupId === 'string');
   const canCopy = selectedElements.length > 0;
 
@@ -376,7 +308,7 @@ function App() {
         </div>
 
         <Toolbar
-          activeTool={present.activeTool}
+          activeTool={view.activeTool}
           canUndo={past.length > 0}
           canRedo={future.length > 0}
           isSaving={saveStatus === 'saving'}
@@ -384,8 +316,8 @@ function App() {
           canPaste={canPaste}
           canGroup={canGroup}
           canUngroup={canUngroup}
-          gridSnapEnabled={present.gridSnapEnabled}
-          scale={present.viewport.scale}
+          gridSnapEnabled={view.gridSnapEnabled}
+          scale={view.viewport.scale}
           onToolChange={(tool) => dispatch({ type: 'set-tool', tool })}
           onUndo={() => dispatch({ type: 'undo' })}
           onRedo={() => dispatch({ type: 'redo' })}
@@ -401,7 +333,7 @@ function App() {
             dispatch({
               type: 'set-viewport',
               viewport: {
-                scale: clamp(present.viewport.scale * 1.1, 0.2, 4),
+                scale: clamp(view.viewport.scale * 1.1, 0.2, 4),
               },
             })
           }
@@ -409,7 +341,7 @@ function App() {
             dispatch({
               type: 'set-viewport',
               viewport: {
-                scale: clamp(present.viewport.scale / 1.1, 0.2, 4),
+                scale: clamp(view.viewport.scale / 1.1, 0.2, 4),
               },
             })
           }
@@ -420,13 +352,15 @@ function App() {
       <main className="workspace-grid">
         <Suspense fallback={<section className="stage-shell" aria-label="加载画布中" />}>
           <CanvasStage
-            elements={present.elements}
-            groups={present.groups}
-            selectedIds={present.selectedIds}
-            tool={present.activeTool}
-            gridSnapEnabled={present.gridSnapEnabled}
+            elements={view.elements}
+            groups={view.groups}
+            selectedIds={view.selectedIds}
+            tool={view.activeTool}
+            gridSnapEnabled={view.gridSnapEnabled}
+            renderCommands={bridgeSnapshot.commands}
+            bridgeMetrics={bridgeFrame.metrics}
             imageInsertVersion={imageInsertVersion}
-            viewport={present.viewport}
+            viewport={view.viewport}
             onSelectionChange={(ids) => dispatch({ type: 'set-selection', ids })}
             onAddElement={(element) => dispatch({ type: 'add-element', element })}
             onPatchElement={(id, patch, trackHistory = true) =>
@@ -434,6 +368,9 @@ function App() {
             }
             onPatchElements={(updates, trackHistory = true) =>
               dispatch({ type: 'patch-elements', updates, trackHistory })
+            }
+            onBringToFront={(ids, trackHistory = true) =>
+              dispatch({ type: 'bring-to-front', ids, trackHistory })
             }
             onViewportChange={(viewport) => dispatch({ type: 'set-viewport', viewport })}
           />
@@ -448,7 +385,7 @@ function App() {
         >
           <PropertiesPanel
             selectedElement={selectedElement}
-            selectionCount={present.selectedIds.length}
+            selectionCount={view.selectedIds.length}
             onPatchElement={(id, patch, trackHistory = true) =>
               dispatch({ type: 'patch-element', id, patch, trackHistory })
             }
