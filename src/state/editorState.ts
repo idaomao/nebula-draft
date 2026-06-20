@@ -266,6 +266,12 @@ export type EditorAction =
   | { type: 'set-grid-snap'; enabled: boolean }
   | { type: 'set-selection'; ids: string[] }
   | { type: 'bring-to-front'; ids: string[]; trackHistory?: boolean }
+  | { type: 'set-element-order'; order: string[]; trackHistory?: boolean }
+  | {
+      type: 'commit-drag-transaction';
+      bringToFrontIds: string[];
+      updates: Array<{ id: string; patch: Partial<BoardElement> }>;
+    }
   | { type: 'clear-selection' }
   | { type: 'add-element'; element: BoardElement }
   | { type: 'add-elements'; elements: BoardElement[] }
@@ -336,6 +342,101 @@ export const editorReducer = (state: EditorHistoryState, action: EditorAction): 
           ...state,
           present: nextPresent,
         };
+      }
+
+      return commit(state, nextPresent);
+    }
+
+    case 'set-element-order': {
+      if (action.order.length === 0) {
+        return state;
+      }
+
+      const nextPresent = clonePresent(state.present);
+      const byId = new Map(nextPresent.elements.map((element) => [element.id, element] as const));
+      const consumed = new Set<string>();
+
+      const reordered: BoardElement[] = [];
+      action.order.forEach((id) => {
+        const element = byId.get(id);
+        if (!element || consumed.has(id)) {
+          return;
+        }
+        consumed.add(id);
+        reordered.push(element);
+      });
+
+      nextPresent.elements.forEach((element) => {
+        if (consumed.has(element.id)) {
+          return;
+        }
+        consumed.add(element.id);
+        reordered.push(element);
+      });
+
+      const hasChanged = reordered.some((element, index) => element.id !== nextPresent.elements[index]?.id);
+      if (!hasChanged) {
+        return state;
+      }
+
+      nextPresent.elements = reordered;
+
+      if (action.trackHistory === false) {
+        return {
+          ...state,
+          present: nextPresent,
+        };
+      }
+
+      return commit(state, nextPresent);
+    }
+
+    case 'commit-drag-transaction': {
+      const hasBringToFront = action.bringToFrontIds.length > 0;
+      const hasUpdates = action.updates.length > 0;
+      if (!hasBringToFront && !hasUpdates) {
+        return state;
+      }
+
+      const nextPresent = clonePresent(state.present);
+      let changed = false;
+
+      if (hasBringToFront) {
+        const existingIdSet = new Set(nextPresent.elements.map((element) => element.id));
+        const targetIds = action.bringToFrontIds.filter((id) => existingIdSet.has(id));
+        if (targetIds.length > 0) {
+          const targetIdSet = new Set(targetIds);
+          const keepElements = nextPresent.elements.filter((element) => !targetIdSet.has(element.id));
+          const frontElements = nextPresent.elements.filter((element) => targetIdSet.has(element.id));
+          const reordered = [...keepElements, ...frontElements];
+          const orderChanged = reordered.some(
+            (element, index) => element.id !== nextPresent.elements[index]?.id,
+          );
+          if (orderChanged) {
+            nextPresent.elements = reordered;
+            changed = true;
+          }
+        }
+      }
+
+      if (hasUpdates) {
+        const updateMap = new Map(action.updates.map((item) => [item.id, item.patch] as const));
+        nextPresent.elements = nextPresent.elements.map((element) => {
+          const patch = updateMap.get(element.id);
+          if (!patch) {
+            return element;
+          }
+
+          const nextElement = mergeElementPatch(element, patch);
+          if (nextElement !== element) {
+            changed = true;
+          }
+          return nextElement;
+        });
+      }
+
+      if (!changed) {
+        return state;
       }
 
       return commit(state, nextPresent);

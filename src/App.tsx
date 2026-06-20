@@ -372,6 +372,12 @@ function App() {
             onBringToFront={(ids, trackHistory = true) =>
               dispatch({ type: 'bring-to-front', ids, trackHistory })
             }
+            onSetElementOrder={(order, trackHistory = true) =>
+              dispatch({ type: 'set-element-order', order, trackHistory })
+            }
+            onCommitDragTransaction={(bringToFrontIds, updates) =>
+              dispatch({ type: 'commit-drag-transaction', bringToFrontIds, updates })
+            }
             onViewportChange={(viewport) => dispatch({ type: 'set-viewport', viewport })}
           />
         </Suspense>

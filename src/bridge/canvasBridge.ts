@@ -2,6 +2,16 @@ import type { BoardElement, EditorPresentState, ElementGroup, ViewportState } fr
 import type { CanvasBridgeSnapshot, CanvasRenderCommand } from '../types/architecture';
 
 const BASE_DIFF_KEYS = ['x', 'y', 'width', 'height', 'rotation', 'fill', 'stroke', 'strokeWidth'] as const;
+const NO_COMMANDS: CanvasRenderCommand[] = [];
+
+const COMMAND_PRIORITY: Record<CanvasRenderCommand['type'], number> = {
+  'replace-selection': 0,
+  'create-element': 1,
+  'update-element': 1,
+  'delete-element': 1,
+  'update-viewport': 2,
+  'update-ui': 3,
+};
 
 const areStringArraysEqual = (first: string[], second: string[]): boolean => {
   if (first.length !== second.length) {
@@ -191,6 +201,140 @@ const diffPresentState = (
   return commands;
 };
 
+const mergeCommand = (
+  mergedCommands: Array<CanvasRenderCommand | null>,
+  elementCommandIndex: Map<string, number>,
+  stateCommandIndex: Map<CanvasRenderCommand['type'], number>,
+  command: CanvasRenderCommand,
+) => {
+  if (command.type === 'replace-selection' || command.type === 'update-viewport' || command.type === 'update-ui') {
+    const existingIndex = stateCommandIndex.get(command.type);
+    if (existingIndex === undefined) {
+      mergedCommands.push(command);
+      stateCommandIndex.set(command.type, mergedCommands.length - 1);
+      return;
+    }
+
+    mergedCommands[existingIndex] = command;
+    return;
+  }
+
+  if (command.type === 'create-element') {
+    const existingIndex = elementCommandIndex.get(command.element.id);
+    if (existingIndex === undefined) {
+      mergedCommands.push(command);
+      elementCommandIndex.set(command.element.id, mergedCommands.length - 1);
+      return;
+    }
+
+    mergedCommands[existingIndex] = command;
+    return;
+  }
+
+  if (command.type === 'update-element') {
+    const existingIndex = elementCommandIndex.get(command.id);
+    if (existingIndex === undefined) {
+      mergedCommands.push(command);
+      elementCommandIndex.set(command.id, mergedCommands.length - 1);
+      return;
+    }
+
+    const existing = mergedCommands[existingIndex];
+    if (!existing) {
+      mergedCommands[existingIndex] = command;
+      return;
+    }
+
+    if (existing.type === 'create-element') {
+      mergedCommands[existingIndex] = {
+        type: 'create-element',
+        element: { ...existing.element, ...command.patch } as BoardElement,
+      };
+      return;
+    }
+
+    if (existing.type === 'update-element') {
+      mergedCommands[existingIndex] = {
+        type: 'update-element',
+        id: command.id,
+        patch: {
+          ...existing.patch,
+          ...command.patch,
+        },
+      };
+      return;
+    }
+
+    if (existing.type === 'delete-element') {
+      return;
+    }
+
+    mergedCommands[existingIndex] = command;
+    return;
+  }
+
+  const existingIndex = elementCommandIndex.get(command.id);
+  if (existingIndex === undefined) {
+    mergedCommands.push(command);
+    elementCommandIndex.set(command.id, mergedCommands.length - 1);
+    return;
+  }
+
+  const existing = mergedCommands[existingIndex];
+  if (!existing) {
+    mergedCommands[existingIndex] = command;
+    return;
+  }
+
+  if (existing.type === 'create-element') {
+    mergedCommands[existingIndex] = null;
+    elementCommandIndex.delete(command.id);
+    return;
+  }
+
+  if (existing.type === 'update-element') {
+    mergedCommands[existingIndex] = command;
+    return;
+  }
+
+  if (existing.type === 'delete-element') {
+    return;
+  }
+
+  mergedCommands[existingIndex] = command;
+};
+
+const optimizeCommands = (commands: CanvasRenderCommand[]): CanvasRenderCommand[] => {
+  if (commands.length <= 1) {
+    return commands;
+  }
+
+  const mergedCommands: Array<CanvasRenderCommand | null> = [];
+  const elementCommandIndex = new Map<string, number>();
+  const stateCommandIndex = new Map<CanvasRenderCommand['type'], number>();
+
+  commands.forEach((command) => {
+    mergeCommand(mergedCommands, elementCommandIndex, stateCommandIndex, command);
+  });
+
+  const compacted = mergedCommands.filter((command): command is CanvasRenderCommand => Boolean(command));
+  if (compacted.length <= 1) {
+    return compacted;
+  }
+
+  return compacted
+    .map((command, index) => ({ command, index }))
+    .sort((first, second) => {
+      const priorityGap = COMMAND_PRIORITY[first.command.type] - COMMAND_PRIORITY[second.command.type];
+      if (priorityGap !== 0) {
+        return priorityGap;
+      }
+
+      return first.index - second.index;
+    })
+    .map((item) => item.command);
+};
+
 export class CanvasBridge {
   private previousSnapshot: CanvasBridgeSnapshot | null = null;
 
@@ -270,11 +414,11 @@ export class CanvasBridge {
       viewport: stableViewport,
     };
 
-    const commands = previousPresent
+    const rawCommands = previousPresent
       ? diffPresentState(previousPresent, nextPresent)
       : createInitialCommands(nextPresent);
+    const commands = optimizeCommands(rawCommands);
 
-    const previousCommands = this.previousSnapshot?.commands;
     const hasElementMutation = commands.some(
       (command) =>
         command.type === 'create-element' ||
@@ -290,7 +434,7 @@ export class CanvasBridge {
     const nextSnapshot: CanvasBridgeSnapshot = {
       present: nextPresent,
       elementById,
-      commands: commands.length === 0 && previousCommands ? previousCommands : commands,
+      commands: commands.length === 0 ? NO_COMMANDS : commands,
     };
 
     this.previousSnapshot = nextSnapshot;

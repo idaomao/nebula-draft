@@ -15,6 +15,10 @@ import { Ellipse, Group, Image as KonvaImage, Layer, Line, Rect, Stage, Text as 
 import { useStageSize } from '../hooks/useStageSize';
 import type { BoardElement, ElementGroup, ImageElement, Tool, ViewportState } from '../types/editor';
 import type { CanvasBridgeMetrics, CanvasRenderCommand } from '../types/architecture';
+import { CoordinateTransformer } from '../lib/Coordinate/CoordinateTransformer';
+import { DOMEventBridge } from '../lib/DOMEventBridge';
+import { EventBridge, type CanvasEventTarget, type CanvasPointerEventType } from '../lib/EventBridge';
+import { CanvasEventSystem } from '../services/interaction/CanvasEventSystem';
 import { useSceneRenderModel } from '../renderer/sceneRenderModel';
 import {
   getNoteDisplayText,
@@ -38,6 +42,7 @@ interface DragSession {
   ownerId: string;
   basePositions: Map<string, Point>;
   pointerStart: Point;
+  baseOrder: string[];
 }
 
 interface ActiveElementDragSession {
@@ -66,6 +71,8 @@ interface CanvasStageProps {
   onPatchElement: (id: string, patch: Partial<BoardElement>, trackHistory?: boolean) => void;
   onPatchElements: (updates: ElementPatchUpdate[], trackHistory?: boolean) => void;
   onBringToFront: (ids: string[], trackHistory?: boolean) => void;
+  onSetElementOrder: (order: string[], trackHistory?: boolean) => void;
+  onCommitDragTransaction: (bringToFrontIds: string[], updates: ElementPatchUpdate[]) => void;
   onViewportChange: (viewport: Partial<ViewportState>) => void;
 }
 
@@ -420,18 +427,6 @@ const getSnapResult = ({
   };
 };
 
-const toWorldPoint = (stage: Konva.Stage, viewport: ViewportState): Point | null => {
-  const pointer = stage.getPointerPosition();
-  if (!pointer) {
-    return null;
-  }
-
-  return {
-    x: (pointer.x - viewport.x) / viewport.scale,
-    y: (pointer.y - viewport.y) / viewport.scale,
-  };
-};
-
 export const CanvasStage = ({
   elements,
   groups,
@@ -447,6 +442,8 @@ export const CanvasStage = ({
   onPatchElement,
   onPatchElements,
   onBringToFront,
+  onSetElementOrder,
+  onCommitDragTransaction,
   onViewportChange,
 }: CanvasStageProps) => {
   const { containerRef, size } = useStageSize<HTMLDivElement>();
@@ -473,6 +470,10 @@ export const CanvasStage = ({
     onDoubleClick: () => undefined,
   });
   const renderElements = useSceneRenderModel(elements, renderCommands);
+  const coordinateTransformer = useMemo(() => new CoordinateTransformer(), []);
+  const eventBridge = useMemo(() => new EventBridge(coordinateTransformer), [coordinateTransformer]);
+  const domEventBridge = useMemo(() => new DOMEventBridge(eventBridge), [eventBridge]);
+  const canvasEventSystem = useMemo(() => new CanvasEventSystem(), []);
 
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const elementsById = useMemo(
@@ -533,6 +534,73 @@ export const CanvasStage = ({
   }, [renderElements, selectedIds]);
 
   useEffect(() => {
+    canvasEventSystem.updateScene(renderElements, groups);
+  }, [canvasEventSystem, groups, renderElements]);
+
+  useEffect(() => {
+    return canvasEventSystem.on(
+      'pointerdown',
+      { type: 'stage', id: 'stage' },
+      'bubble',
+      (event) => {
+        if (tool !== 'select' || event.target.type !== 'stage' || event.modifiers.shift) {
+          return;
+        }
+
+        if (!editingNoteId) {
+          onSelectionChange([]);
+        }
+      },
+      10,
+    );
+  }, [canvasEventSystem, editingNoteId, onSelectionChange, tool]);
+
+  useEffect(() => {
+    return canvasEventSystem.on(
+      'keyboard:down',
+      { type: 'stage', id: 'stage' },
+      'target',
+      (event) => {
+        if (event.type !== 'keyboard:down' || event.key !== 'Escape') {
+          return;
+        }
+
+        activeElementDragRef.current = null;
+        setSnapGuides([]);
+
+        if (marqueeStart || marqueeCurrent) {
+          setMarqueeStart(null);
+          setMarqueeCurrent(null);
+          event.preventDefault();
+          return;
+        }
+
+        if (tool === 'select' && selectedIds.length > 0 && !editingNoteId) {
+          onSelectionChange([]);
+          event.preventDefault();
+        }
+      },
+      20,
+    );
+  }, [
+    canvasEventSystem,
+    editingNoteId,
+    marqueeCurrent,
+    marqueeStart,
+    onSelectionChange,
+    selectedIds.length,
+    tool,
+  ]);
+
+  useEffect(() => {
+    return domEventBridge.init({
+      onEvent: (event) => {
+        canvasEventSystem.dispatch(event);
+      },
+    });
+  }, [canvasEventSystem, domEventBridge]);
+
+  useEffect(() => {
     if (imageInsertVersion <= 0 || imageInsertVersion === lastImageInsertVersionRef.current) {
       return;
     }
@@ -585,6 +653,39 @@ export const CanvasStage = ({
     nodeRefs.current.delete(id);
   };
 
+  const dispatchCanvasPointerEvent = (
+    type: CanvasPointerEventType,
+    event: KonvaEventObject<MouseEvent | TouchEvent>,
+    explicitTarget?: CanvasEventTarget,
+  ) => {
+    const stage = event.target.getStage();
+    if (!stage) {
+      return null;
+    }
+
+    const stageEvent = eventBridge.toCanvasPointerEvent({
+      type,
+      stage,
+      viewport,
+      target: { type: 'stage', id: 'stage' },
+      native: event,
+    });
+
+    if (!stageEvent) {
+      return null;
+    }
+
+    const resolvedTarget = explicitTarget ?? canvasEventSystem.hitTest(stageEvent.world);
+    const unifiedEvent = {
+      ...stageEvent,
+      target: resolvedTarget,
+      currentTarget: resolvedTarget,
+    };
+
+    canvasEventSystem.dispatch(unifiedEvent);
+    return unifiedEvent;
+  };
+
   const getSelectionForElement = (id: string): string[] => {
     const element = elementsById.get(id);
     if (element?.groupId) {
@@ -628,6 +729,7 @@ export const CanvasStage = ({
       ownerId,
       basePositions,
       pointerStart,
+      baseOrder: renderElements.map((element) => element.id),
     };
   };
 
@@ -697,26 +799,124 @@ export const CanvasStage = ({
     onPatchElements(updates, trackHistory);
   };
 
+  const commitDragSession = (
+    session: DragSession,
+    pointerWorld: Point,
+    includeBringToFront: boolean,
+  ) => {
+    const ownerBase = session.basePositions.get(session.ownerId);
+    if (!ownerBase) {
+      return;
+    }
+
+    const ownerElement = elementsById.get(session.ownerId);
+    if (!ownerElement) {
+      return;
+    }
+
+    const delta = {
+      x: pointerWorld.x - session.pointerStart.x,
+      y: pointerWorld.y - session.pointerStart.y,
+    };
+
+    const ownerCandidate = {
+      x: ownerBase.x + delta.x,
+      y: ownerBase.y + delta.y,
+    };
+
+    // 回滚拖拽期的临时预览状态（位置 + 层级顺序），再做一次性事务提交。
+    onSetElementOrder(session.baseOrder, false);
+
+    if (session.basePositions.size === 1) {
+      let finalPosition = ownerCandidate;
+
+      if (gridSnapEnabled) {
+        finalPosition = snapPointToGrid(ownerCandidate, GRID_SIZE);
+      } else {
+        const snapped = getSnapResult({
+          movingElement: ownerElement,
+          candidate: ownerCandidate,
+          elements,
+          ignoreIds: new Set([session.ownerId]),
+          viewportScale: viewport.scale,
+        });
+        finalPosition = { x: snapped.x, y: snapped.y };
+      }
+
+      onPatchElement(session.ownerId, { x: ownerBase.x, y: ownerBase.y }, false);
+      onCommitDragTransaction(
+        includeBringToFront ? [session.ownerId] : [],
+        [
+          {
+            id: session.ownerId,
+            patch: { x: finalPosition.x, y: finalPosition.y },
+          },
+        ],
+      );
+      setSnapGuides([]);
+      return;
+    }
+
+    let nextDx = delta.x;
+    let nextDy = delta.y;
+
+    if (gridSnapEnabled) {
+      const snappedOwner = snapPointToGrid(ownerCandidate, GRID_SIZE);
+      nextDx = snappedOwner.x - ownerBase.x;
+      nextDy = snappedOwner.y - ownerBase.y;
+    }
+
+    const rollbackUpdates: ElementPatchUpdate[] = [];
+    const finalUpdates: ElementPatchUpdate[] = [];
+
+    session.basePositions.forEach((position, id) => {
+      rollbackUpdates.push({
+        id,
+        patch: {
+          x: position.x,
+          y: position.y,
+        },
+      });
+
+      finalUpdates.push({
+        id,
+        patch: {
+          x: position.x + nextDx,
+          y: position.y + nextDy,
+        },
+      });
+    });
+
+    onPatchElements(rollbackUpdates, false);
+    onCommitDragTransaction(
+      includeBringToFront ? Array.from(session.basePositions.keys()) : [],
+      finalUpdates,
+    );
+    setSnapGuides([]);
+  };
+
   const handleElementPointerDown = (
     event: KonvaEventObject<MouseEvent | TouchEvent>,
     id: string,
     currentTool: Tool,
   ) => {
+    const canvasEvent = dispatchCanvasPointerEvent('pointerdown', event, {
+      type: 'element',
+      id,
+    });
+    if (!canvasEvent) {
+      return;
+    }
+
     if (currentTool !== 'select') {
       return;
     }
 
     event.cancelBubble = true;
-
-    const stage = event.target.getStage();
-    const pointerWorld = stage ? toWorldPoint(stage, viewport) : null;
-    if (!pointerWorld) {
-      return;
-    }
+    const pointerWorld = canvasEvent.world;
     latestPointerWorldRef.current = pointerWorld;
 
-    const shiftKey = 'shiftKey' in event.evt ? event.evt.shiftKey : false;
-    if (shiftKey) {
+    if (canvasEvent.modifiers.shift) {
       activeElementDragRef.current = null;
       if (selectedIdSet.has(id)) {
         onSelectionChange(selectedIds.filter((item) => item !== id));
@@ -843,16 +1043,12 @@ export const CanvasStage = ({
   };
 
   const handleStagePointerDown = (event: KonvaEventObject<MouseEvent | TouchEvent>) => {
-    const stage = event.target.getStage();
-    if (!stage) {
+    const canvasEvent = dispatchCanvasPointerEvent('pointerdown', event);
+    if (!canvasEvent) {
       return;
     }
-
-    const clickedEmptySpace = event.target === stage;
-    const worldPoint = toWorldPoint(stage, viewport);
-    if (!worldPoint) {
-      return;
-    }
+    const clickedEmptySpace = canvasEvent.target.type === 'stage';
+    const worldPoint = canvasEvent.world;
     latestPointerWorldRef.current = worldPoint;
 
     const snappedPoint = gridSnapEnabled ? snapPointToGrid(worldPoint, GRID_SIZE) : worldPoint;
@@ -891,26 +1087,19 @@ export const CanvasStage = ({
 
     if (tool === 'select' && clickedEmptySpace) {
       activeElementDragRef.current = null;
-      const appendSelection = 'shiftKey' in event.evt ? event.evt.shiftKey : false;
+      const appendSelection = canvasEvent.modifiers.shift;
       marqueeAppendRef.current = appendSelection;
       setMarqueeStart(worldPoint);
       setMarqueeCurrent(worldPoint);
-      if (!appendSelection) {
-        onSelectionChange([]);
-      }
     }
   };
 
   const handleStagePointerMove = (event: KonvaEventObject<MouseEvent | TouchEvent>) => {
-    const stage = event.target.getStage();
-    if (!stage) {
+    const canvasEvent = dispatchCanvasPointerEvent('pointermove', event);
+    if (!canvasEvent) {
       return;
     }
-
-    const worldPoint = toWorldPoint(stage, viewport);
-    if (!worldPoint) {
-      return;
-    }
+    const worldPoint = canvasEvent.world;
     latestPointerWorldRef.current = worldPoint;
 
     const activeDrag = activeElementDragRef.current;
@@ -946,16 +1135,29 @@ export const CanvasStage = ({
     setDrawingCurrent(gridSnapEnabled ? snapPointToGrid(worldPoint, GRID_SIZE) : worldPoint);
   };
 
-  const handleStagePointerUp = () => {
+  const finalizeActiveDrag = () => {
     const activeDrag = activeElementDragRef.current;
-    if (activeDrag) {
-      if (activeDrag.moved) {
-        const pointerWorld = latestPointerWorldRef.current ?? activeDrag.session.pointerStart;
-        runDragSession(activeDrag.session, pointerWorld, true);
-      }
+    if (!activeDrag) {
+      return false;
+    }
 
-      activeElementDragRef.current = null;
-      setSnapGuides([]);
+    if (activeDrag.moved) {
+      const pointerWorld = latestPointerWorldRef.current ?? activeDrag.session.pointerStart;
+      commitDragSession(activeDrag.session, pointerWorld, activeDrag.elevated);
+    }
+
+    activeElementDragRef.current = null;
+    setSnapGuides([]);
+    return true;
+  };
+
+  const handleStagePointerUp = (event: KonvaEventObject<MouseEvent | TouchEvent>) => {
+    const canvasEvent = dispatchCanvasPointerEvent('pointerup', event);
+    if (canvasEvent) {
+      latestPointerWorldRef.current = canvasEvent.world;
+    }
+
+    if (finalizeActiveDrag()) {
       return;
     }
 
@@ -1059,6 +1261,24 @@ export const CanvasStage = ({
       strokeWidth: 2,
     });
   };
+
+  useEffect(() => {
+    const handleGlobalPointerUp = () => {
+      finalizeActiveDrag();
+    };
+
+    const handleGlobalTouchEnd = () => {
+      finalizeActiveDrag();
+    };
+
+    window.addEventListener('pointerup', handleGlobalPointerUp);
+    window.addEventListener('touchend', handleGlobalTouchEnd);
+
+    return () => {
+      window.removeEventListener('pointerup', handleGlobalPointerUp);
+      window.removeEventListener('touchend', handleGlobalTouchEnd);
+    };
+  }, [finalizeActiveDrag]);
 
   const handleElementTransformEnd = (event: KonvaEventObject<Event>, element: BoardElement) => {
     if (selectedIds.length !== 1 || selectedIds[0] !== element.id) {
