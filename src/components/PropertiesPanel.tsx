@@ -218,7 +218,7 @@ export const PropertiesPanel = ({
       {selectedElement.kind === 'note' && selectionCount === 1 ? (
         <>
           <label className="field">
-            <span>文本内容</span>
+            <span>富文本内容</span>
             <div className="rich-editor-toolbar">
               <button type="button" className="tool-btn" onClick={() => runRichCommand('bold')}>
                 B

@@ -1,19 +1,27 @@
 import {
   useEffect,
+  memo,
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
+  type MutableRefObject,
   type ChangeEvent,
   type FocusEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import type Konva from 'konva';
 import type { KonvaEventObject } from 'konva/lib/Node';
-import { Ellipse, Group, Image as KonvaImage, Layer, Line, Rect, Stage, Transformer } from 'react-konva';
+import { Ellipse, Group, Image as KonvaImage, Layer, Line, Rect, Stage, Text as KonvaText, Transformer } from 'react-konva';
 import { useStageSize } from '../hooks/useStageSize';
 import type { BoardElement, ElementGroup, ImageElement, Tool, ViewportState } from '../types/editor';
+import type { CanvasBridgeMetrics, CanvasRenderCommand } from '../types/architecture';
+import { CoordinateTransformer } from '../lib/Coordinate/CoordinateTransformer';
+import { DOMEventBridge } from '../lib/DOMEventBridge';
+import { EventBridge, type CanvasEventTarget, type CanvasPointerEventType } from '../lib/EventBridge';
+import { CanvasEventSystem } from '../services/interaction/CanvasEventSystem';
+import { useSceneRenderModel } from '../renderer/sceneRenderModel';
 import {
+  getNoteDisplayText,
   normalizeRichText,
   plainTextToRichText,
   richTextToPlainText,
@@ -34,22 +42,18 @@ interface DragSession {
   ownerId: string;
   basePositions: Map<string, Point>;
   pointerStart: Point;
+  baseOrder: string[];
 }
 
 interface ActiveElementDragSession {
   session: DragSession;
   moved: boolean;
+  elevated: boolean;
 }
 
 interface ElementPatchUpdate {
   id: string;
   patch: Partial<BoardElement>;
-}
-
-interface NoteDisplayItem {
-  id: string;
-  html: string;
-  style: CSSProperties;
 }
 
 interface CanvasStageProps {
@@ -58,12 +62,17 @@ interface CanvasStageProps {
   selectedIds: string[];
   tool: Tool;
   gridSnapEnabled: boolean;
+  renderCommands: CanvasRenderCommand[];
+  bridgeMetrics: CanvasBridgeMetrics;
   imageInsertVersion: number;
   viewport: ViewportState;
   onSelectionChange: (ids: string[]) => void;
   onAddElement: (element: BoardElement) => void;
   onPatchElement: (id: string, patch: Partial<BoardElement>, trackHistory?: boolean) => void;
   onPatchElements: (updates: ElementPatchUpdate[], trackHistory?: boolean) => void;
+  onBringToFront: (ids: string[], trackHistory?: boolean) => void;
+  onSetElementOrder: (order: string[], trackHistory?: boolean) => void;
+  onCommitDragTransaction: (bringToFrontIds: string[], updates: ElementPatchUpdate[]) => void;
   onViewportChange: (viewport: Partial<ViewportState>) => void;
 }
 
@@ -186,6 +195,126 @@ const CanvasImageNode = ({ element }: { element: ImageElement }) => {
   );
 };
 
+interface ElementNodeHandlers {
+  onPointerDown: (
+    event: KonvaEventObject<MouseEvent | TouchEvent>,
+    id: string,
+    currentTool: Tool,
+  ) => void;
+  onTransformEnd: (event: KonvaEventObject<Event>, element: BoardElement) => void;
+  onDoubleClick: (element: BoardElement) => void;
+}
+
+interface ElementNodeProps {
+  element: BoardElement;
+  tool: Tool;
+  setNodeRef: (id: string, node: Konva.Group | null) => void;
+  handlersRef: MutableRefObject<ElementNodeHandlers>;
+}
+
+const ElementNode = memo(
+  ({ element, tool, setNodeRef, handlersRef }: ElementNodeProps) => {
+    return (
+      <Group
+        key={element.id}
+        id={element.id}
+        x={element.x}
+        y={element.y}
+        rotation={element.rotation}
+        ref={(node) => setNodeRef(element.id, node)}
+        draggable={false}
+        onMouseDown={(event) => handlersRef.current.onPointerDown(event, element.id, tool)}
+        onTouchStart={(event) => handlersRef.current.onPointerDown(event, element.id, tool)}
+        onTransformEnd={(event) => handlersRef.current.onTransformEnd(event, element)}
+        onDblClick={() => handlersRef.current.onDoubleClick(element)}
+        onDblTap={() => handlersRef.current.onDoubleClick(element)}
+      >
+        {element.kind === 'rect' ? (
+          <Rect
+            width={element.width}
+            height={element.height}
+            fill={element.fill}
+            stroke={element.stroke}
+            strokeWidth={element.strokeWidth}
+            cornerRadius={8}
+          />
+        ) : null}
+
+        {element.kind === 'ellipse' ? (
+          <Ellipse
+            x={element.width / 2}
+            y={element.height / 2}
+            radiusX={element.width / 2}
+            radiusY={element.height / 2}
+            fill={element.fill}
+            stroke={element.stroke}
+            strokeWidth={element.strokeWidth}
+          />
+        ) : null}
+
+        {element.kind === 'triangle' ? (
+          <Line
+            points={[element.width / 2, 0, element.width, element.height, 0, element.height]}
+            closed
+            fill={element.fill}
+            stroke={element.stroke}
+            strokeWidth={element.strokeWidth}
+            lineJoin="round"
+          />
+        ) : null}
+
+        {element.kind === 'diamond' ? (
+          <Line
+            points={[
+              element.width / 2,
+              0,
+              element.width,
+              element.height / 2,
+              element.width / 2,
+              element.height,
+              0,
+              element.height / 2,
+            ]}
+            closed
+            fill={element.fill}
+            stroke={element.stroke}
+            strokeWidth={element.strokeWidth}
+            lineJoin="round"
+          />
+        ) : null}
+
+        {element.kind === 'image' ? <CanvasImageNode element={element} /> : null}
+
+        {element.kind === 'note' ? (
+          <>
+            <Rect
+              width={element.width}
+              height={element.height}
+              fill={element.fill}
+              stroke={element.stroke}
+              strokeWidth={element.strokeWidth}
+              cornerRadius={10}
+            />
+            <KonvaText
+              x={12}
+              y={10}
+              width={Math.max(0, element.width - 24)}
+              height={Math.max(0, element.height - 20)}
+              text={getNoteDisplayText(element.text, element.richText)}
+              fontSize={element.fontSize}
+              fill={element.textColor}
+              lineHeight={1.35}
+              wrap="word"
+              listening={false}
+            />
+          </>
+        ) : null}
+      </Group>
+    );
+  },
+  (prev, next) => prev.element === next.element && prev.tool === next.tool,
+);
+
 const intersectsBounds = (
   first: { x: number; y: number; width: number; height: number },
   second: { x: number; y: number; width: number; height: number },
@@ -298,30 +427,23 @@ const getSnapResult = ({
   };
 };
 
-const toWorldPoint = (stage: Konva.Stage, viewport: ViewportState): Point | null => {
-  const pointer = stage.getPointerPosition();
-  if (!pointer) {
-    return null;
-  }
-
-  return {
-    x: (pointer.x - viewport.x) / viewport.scale,
-    y: (pointer.y - viewport.y) / viewport.scale,
-  };
-};
-
 export const CanvasStage = ({
   elements,
   groups,
   selectedIds,
   tool,
   gridSnapEnabled,
+  renderCommands,
+  bridgeMetrics,
   imageInsertVersion,
   viewport,
   onSelectionChange,
   onAddElement,
   onPatchElement,
   onPatchElements,
+  onBringToFront,
+  onSetElementOrder,
+  onCommitDragTransaction,
   onViewportChange,
 }: CanvasStageProps) => {
   const { containerRef, size } = useStageSize<HTMLDivElement>();
@@ -342,11 +464,21 @@ export const CanvasStage = ({
   const [marqueeCurrent, setMarqueeCurrent] = useState<Point | null>(null);
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
+  const elementNodeHandlersRef = useRef<ElementNodeHandlers>({
+    onPointerDown: () => undefined,
+    onTransformEnd: () => undefined,
+    onDoubleClick: () => undefined,
+  });
+  const renderElements = useSceneRenderModel(elements, renderCommands);
+  const coordinateTransformer = useMemo(() => new CoordinateTransformer(), []);
+  const eventBridge = useMemo(() => new EventBridge(coordinateTransformer), [coordinateTransformer]);
+  const domEventBridge = useMemo(() => new DOMEventBridge(eventBridge), [eventBridge]);
+  const canvasEventSystem = useMemo(() => new CanvasEventSystem(), []);
 
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const elementsById = useMemo(
-    () => new Map(elements.map((element) => [element.id, element] as const)),
-    [elements],
+    () => new Map(renderElements.map((element) => [element.id, element] as const)),
+    [renderElements],
   );
   const groupsById = useMemo(() => new Map(groups.map((group) => [group.id, group] as const)), [groups]);
   const editingNote = useMemo(() => {
@@ -370,31 +502,6 @@ export const CanvasStage = ({
       minHeight: Math.max(120, editingNote.height * viewport.scale),
     };
   }, [editingNote, viewport.scale, viewport.x, viewport.y]);
-
-  const noteDisplayItems = useMemo<NoteDisplayItem[]>(() => {
-    return elements
-      .filter((element): element is BoardElement & { kind: 'note' } => element.kind === 'note')
-      .filter((note) => note.id !== editingNoteId)
-      .map((note) => {
-        const contentLeft = (note.x + 12) * viewport.scale + viewport.x;
-        const contentTop = (note.y + 10) * viewport.scale + viewport.y;
-
-        return {
-          id: note.id,
-          html: normalizeRichText(note.richText),
-          style: {
-            left: contentLeft,
-            top: contentTop,
-            width: Math.max(0, note.width - 24) * viewport.scale,
-            height: Math.max(0, note.height - 20) * viewport.scale,
-            fontSize: Math.max(10, note.fontSize * viewport.scale),
-            color: note.textColor,
-            transform: `rotate(${note.rotation}deg)`,
-            transformOrigin: 'top left',
-          },
-        };
-      });
-  }, [editingNoteId, elements, viewport.scale, viewport.x, viewport.y]);
 
   const draftBounds = useMemo(() => {
     if (!drawingStart || !drawingCurrent) {
@@ -424,7 +531,74 @@ export const CanvasStage = ({
     }
 
     transformer.getLayer()?.batchDraw();
-  }, [elements, selectedIds]);
+  }, [renderElements, selectedIds]);
+
+  useEffect(() => {
+    canvasEventSystem.updateScene(renderElements, groups);
+  }, [canvasEventSystem, groups, renderElements]);
+
+  useEffect(() => {
+    return canvasEventSystem.on(
+      'pointerdown',
+      { type: 'stage', id: 'stage' },
+      'bubble',
+      (event) => {
+        if (tool !== 'select' || event.target.type !== 'stage' || event.modifiers.shift) {
+          return;
+        }
+
+        if (!editingNoteId) {
+          onSelectionChange([]);
+        }
+      },
+      10,
+    );
+  }, [canvasEventSystem, editingNoteId, onSelectionChange, tool]);
+
+  useEffect(() => {
+    return canvasEventSystem.on(
+      'keyboard:down',
+      { type: 'stage', id: 'stage' },
+      'target',
+      (event) => {
+        if (event.type !== 'keyboard:down' || event.key !== 'Escape') {
+          return;
+        }
+
+        activeElementDragRef.current = null;
+        setSnapGuides([]);
+
+        if (marqueeStart || marqueeCurrent) {
+          setMarqueeStart(null);
+          setMarqueeCurrent(null);
+          event.preventDefault();
+          return;
+        }
+
+        if (tool === 'select' && selectedIds.length > 0 && !editingNoteId) {
+          onSelectionChange([]);
+          event.preventDefault();
+        }
+      },
+      20,
+    );
+  }, [
+    canvasEventSystem,
+    editingNoteId,
+    marqueeCurrent,
+    marqueeStart,
+    onSelectionChange,
+    selectedIds.length,
+    tool,
+  ]);
+
+  useEffect(() => {
+    return domEventBridge.init({
+      onEvent: (event) => {
+        canvasEventSystem.dispatch(event);
+      },
+    });
+  }, [canvasEventSystem, domEventBridge]);
 
   useEffect(() => {
     if (imageInsertVersion <= 0 || imageInsertVersion === lastImageInsertVersionRef.current) {
@@ -479,6 +653,39 @@ export const CanvasStage = ({
     nodeRefs.current.delete(id);
   };
 
+  const dispatchCanvasPointerEvent = (
+    type: CanvasPointerEventType,
+    event: KonvaEventObject<MouseEvent | TouchEvent>,
+    explicitTarget?: CanvasEventTarget,
+  ) => {
+    const stage = event.target.getStage();
+    if (!stage) {
+      return null;
+    }
+
+    const stageEvent = eventBridge.toCanvasPointerEvent({
+      type,
+      stage,
+      viewport,
+      target: { type: 'stage', id: 'stage' },
+      native: event,
+    });
+
+    if (!stageEvent) {
+      return null;
+    }
+
+    const resolvedTarget = explicitTarget ?? canvasEventSystem.hitTest(stageEvent.world);
+    const unifiedEvent = {
+      ...stageEvent,
+      target: resolvedTarget,
+      currentTarget: resolvedTarget,
+    };
+
+    canvasEventSystem.dispatch(unifiedEvent);
+    return unifiedEvent;
+  };
+
   const getSelectionForElement = (id: string): string[] => {
     const element = elementsById.get(id);
     if (element?.groupId) {
@@ -522,6 +729,7 @@ export const CanvasStage = ({
       ownerId,
       basePositions,
       pointerStart,
+      baseOrder: renderElements.map((element) => element.id),
     };
   };
 
@@ -591,26 +799,124 @@ export const CanvasStage = ({
     onPatchElements(updates, trackHistory);
   };
 
+  const commitDragSession = (
+    session: DragSession,
+    pointerWorld: Point,
+    includeBringToFront: boolean,
+  ) => {
+    const ownerBase = session.basePositions.get(session.ownerId);
+    if (!ownerBase) {
+      return;
+    }
+
+    const ownerElement = elementsById.get(session.ownerId);
+    if (!ownerElement) {
+      return;
+    }
+
+    const delta = {
+      x: pointerWorld.x - session.pointerStart.x,
+      y: pointerWorld.y - session.pointerStart.y,
+    };
+
+    const ownerCandidate = {
+      x: ownerBase.x + delta.x,
+      y: ownerBase.y + delta.y,
+    };
+
+    // 回滚拖拽期的临时预览状态（位置 + 层级顺序），再做一次性事务提交。
+    onSetElementOrder(session.baseOrder, false);
+
+    if (session.basePositions.size === 1) {
+      let finalPosition = ownerCandidate;
+
+      if (gridSnapEnabled) {
+        finalPosition = snapPointToGrid(ownerCandidate, GRID_SIZE);
+      } else {
+        const snapped = getSnapResult({
+          movingElement: ownerElement,
+          candidate: ownerCandidate,
+          elements,
+          ignoreIds: new Set([session.ownerId]),
+          viewportScale: viewport.scale,
+        });
+        finalPosition = { x: snapped.x, y: snapped.y };
+      }
+
+      onPatchElement(session.ownerId, { x: ownerBase.x, y: ownerBase.y }, false);
+      onCommitDragTransaction(
+        includeBringToFront ? [session.ownerId] : [],
+        [
+          {
+            id: session.ownerId,
+            patch: { x: finalPosition.x, y: finalPosition.y },
+          },
+        ],
+      );
+      setSnapGuides([]);
+      return;
+    }
+
+    let nextDx = delta.x;
+    let nextDy = delta.y;
+
+    if (gridSnapEnabled) {
+      const snappedOwner = snapPointToGrid(ownerCandidate, GRID_SIZE);
+      nextDx = snappedOwner.x - ownerBase.x;
+      nextDy = snappedOwner.y - ownerBase.y;
+    }
+
+    const rollbackUpdates: ElementPatchUpdate[] = [];
+    const finalUpdates: ElementPatchUpdate[] = [];
+
+    session.basePositions.forEach((position, id) => {
+      rollbackUpdates.push({
+        id,
+        patch: {
+          x: position.x,
+          y: position.y,
+        },
+      });
+
+      finalUpdates.push({
+        id,
+        patch: {
+          x: position.x + nextDx,
+          y: position.y + nextDy,
+        },
+      });
+    });
+
+    onPatchElements(rollbackUpdates, false);
+    onCommitDragTransaction(
+      includeBringToFront ? Array.from(session.basePositions.keys()) : [],
+      finalUpdates,
+    );
+    setSnapGuides([]);
+  };
+
   const handleElementPointerDown = (
     event: KonvaEventObject<MouseEvent | TouchEvent>,
     id: string,
     currentTool: Tool,
   ) => {
+    const canvasEvent = dispatchCanvasPointerEvent('pointerdown', event, {
+      type: 'element',
+      id,
+    });
+    if (!canvasEvent) {
+      return;
+    }
+
     if (currentTool !== 'select') {
       return;
     }
 
     event.cancelBubble = true;
-
-    const stage = event.target.getStage();
-    const pointerWorld = stage ? toWorldPoint(stage, viewport) : null;
-    if (!pointerWorld) {
-      return;
-    }
+    const pointerWorld = canvasEvent.world;
     latestPointerWorldRef.current = pointerWorld;
 
-    const shiftKey = 'shiftKey' in event.evt ? event.evt.shiftKey : false;
-    if (shiftKey) {
+    if (canvasEvent.modifiers.shift) {
       activeElementDragRef.current = null;
       if (selectedIdSet.has(id)) {
         onSelectionChange(selectedIds.filter((item) => item !== id));
@@ -633,6 +939,7 @@ export const CanvasStage = ({
     activeElementDragRef.current = {
       session,
       moved: false,
+      elevated: false,
     };
   };
 
@@ -736,16 +1043,12 @@ export const CanvasStage = ({
   };
 
   const handleStagePointerDown = (event: KonvaEventObject<MouseEvent | TouchEvent>) => {
-    const stage = event.target.getStage();
-    if (!stage) {
+    const canvasEvent = dispatchCanvasPointerEvent('pointerdown', event);
+    if (!canvasEvent) {
       return;
     }
-
-    const clickedEmptySpace = event.target === stage;
-    const worldPoint = toWorldPoint(stage, viewport);
-    if (!worldPoint) {
-      return;
-    }
+    const clickedEmptySpace = canvasEvent.target.type === 'stage';
+    const worldPoint = canvasEvent.world;
     latestPointerWorldRef.current = worldPoint;
 
     const snappedPoint = gridSnapEnabled ? snapPointToGrid(worldPoint, GRID_SIZE) : worldPoint;
@@ -766,8 +1069,8 @@ export const CanvasStage = ({
         fill: '#fef4d6',
         stroke: '#9b8a35',
         strokeWidth: 1.5,
-        text: '双击编辑文本',
-        richText: plainTextToRichText('双击编辑文本'),
+        text: '在属性面板中编辑富文本',
+        richText: plainTextToRichText('在属性面板中编辑富文本'),
         fontSize: 18,
         textColor: '#3a3416',
       });
@@ -784,26 +1087,19 @@ export const CanvasStage = ({
 
     if (tool === 'select' && clickedEmptySpace) {
       activeElementDragRef.current = null;
-      const appendSelection = 'shiftKey' in event.evt ? event.evt.shiftKey : false;
+      const appendSelection = canvasEvent.modifiers.shift;
       marqueeAppendRef.current = appendSelection;
       setMarqueeStart(worldPoint);
       setMarqueeCurrent(worldPoint);
-      if (!appendSelection) {
-        onSelectionChange([]);
-      }
     }
   };
 
   const handleStagePointerMove = (event: KonvaEventObject<MouseEvent | TouchEvent>) => {
-    const stage = event.target.getStage();
-    if (!stage) {
+    const canvasEvent = dispatchCanvasPointerEvent('pointermove', event);
+    if (!canvasEvent) {
       return;
     }
-
-    const worldPoint = toWorldPoint(stage, viewport);
-    if (!worldPoint) {
-      return;
-    }
+    const worldPoint = canvasEvent.world;
     latestPointerWorldRef.current = worldPoint;
 
     const activeDrag = activeElementDragRef.current;
@@ -819,6 +1115,10 @@ export const CanvasStage = ({
       }
 
       activeDrag.moved = true;
+      if (!activeDrag.elevated) {
+        onBringToFront(Array.from(activeDrag.session.basePositions.keys()), false);
+        activeDrag.elevated = true;
+      }
       runDragSession(activeDrag.session, worldPoint, false);
       return;
     }
@@ -835,16 +1135,29 @@ export const CanvasStage = ({
     setDrawingCurrent(gridSnapEnabled ? snapPointToGrid(worldPoint, GRID_SIZE) : worldPoint);
   };
 
-  const handleStagePointerUp = () => {
+  const finalizeActiveDrag = () => {
     const activeDrag = activeElementDragRef.current;
-    if (activeDrag) {
-      if (activeDrag.moved) {
-        const pointerWorld = latestPointerWorldRef.current ?? activeDrag.session.pointerStart;
-        runDragSession(activeDrag.session, pointerWorld, true);
-      }
+    if (!activeDrag) {
+      return false;
+    }
 
-      activeElementDragRef.current = null;
-      setSnapGuides([]);
+    if (activeDrag.moved) {
+      const pointerWorld = latestPointerWorldRef.current ?? activeDrag.session.pointerStart;
+      commitDragSession(activeDrag.session, pointerWorld, activeDrag.elevated);
+    }
+
+    activeElementDragRef.current = null;
+    setSnapGuides([]);
+    return true;
+  };
+
+  const handleStagePointerUp = (event: KonvaEventObject<MouseEvent | TouchEvent>) => {
+    const canvasEvent = dispatchCanvasPointerEvent('pointerup', event);
+    if (canvasEvent) {
+      latestPointerWorldRef.current = canvasEvent.world;
+    }
+
+    if (finalizeActiveDrag()) {
       return;
     }
 
@@ -859,7 +1172,7 @@ export const CanvasStage = ({
         return;
       }
 
-      const hits = elements
+      const hits = renderElements
         .filter((element) => intersectsBounds(bounds, getElementBounds(element)))
         .flatMap((element) => {
           if (!element.groupId) {
@@ -949,6 +1262,24 @@ export const CanvasStage = ({
     });
   };
 
+  useEffect(() => {
+    const handleGlobalPointerUp = () => {
+      finalizeActiveDrag();
+    };
+
+    const handleGlobalTouchEnd = () => {
+      finalizeActiveDrag();
+    };
+
+    window.addEventListener('pointerup', handleGlobalPointerUp);
+    window.addEventListener('touchend', handleGlobalTouchEnd);
+
+    return () => {
+      window.removeEventListener('pointerup', handleGlobalPointerUp);
+      window.removeEventListener('touchend', handleGlobalTouchEnd);
+    };
+  }, [finalizeActiveDrag]);
+
   const handleElementTransformEnd = (event: KonvaEventObject<Event>, element: BoardElement) => {
     if (selectedIds.length !== 1 || selectedIds[0] !== element.id) {
       return;
@@ -984,6 +1315,12 @@ export const CanvasStage = ({
 
     onSelectionChange([element.id]);
     setEditingNoteId(element.id);
+  };
+
+  elementNodeHandlersRef.current = {
+    onPointerDown: handleElementPointerDown,
+    onTransformEnd: handleElementTransformEnd,
+    onDoubleClick: handleElementDoubleClick,
   };
 
   const handleWheel = (event: KonvaEventObject<WheelEvent>) => {
@@ -1055,91 +1392,15 @@ export const CanvasStage = ({
         onWheel={handleWheel}
       >
         <Layer>
-          {elements.map((element) => {
+          {renderElements.map((element) => {
             return (
-              <Group
+              <ElementNode
                 key={element.id}
-                id={element.id}
-                x={element.x}
-                y={element.y}
-                rotation={element.rotation}
-                ref={(node) => setNodeRef(element.id, node)}
-                draggable={false}
-                onMouseDown={(event) => handleElementPointerDown(event, element.id, tool)}
-                onTouchStart={(event) => handleElementPointerDown(event, element.id, tool)}
-                onTransformEnd={(event) => handleElementTransformEnd(event, element)}
-                onDblClick={() => handleElementDoubleClick(element)}
-                onDblTap={() => handleElementDoubleClick(element)}
-              >
-                {element.kind === 'rect' ? (
-                  <Rect
-                    width={element.width}
-                    height={element.height}
-                    fill={element.fill}
-                    stroke={element.stroke}
-                    strokeWidth={element.strokeWidth}
-                    cornerRadius={8}
-                  />
-                ) : null}
-
-                {element.kind === 'ellipse' ? (
-                  <Ellipse
-                    x={element.width / 2}
-                    y={element.height / 2}
-                    radiusX={element.width / 2}
-                    radiusY={element.height / 2}
-                    fill={element.fill}
-                    stroke={element.stroke}
-                    strokeWidth={element.strokeWidth}
-                  />
-                ) : null}
-
-                {element.kind === 'triangle' ? (
-                  <Line
-                    points={[element.width / 2, 0, element.width, element.height, 0, element.height]}
-                    closed
-                    fill={element.fill}
-                    stroke={element.stroke}
-                    strokeWidth={element.strokeWidth}
-                    lineJoin="round"
-                  />
-                ) : null}
-
-                {element.kind === 'diamond' ? (
-                  <Line
-                    points={[
-                      element.width / 2,
-                      0,
-                      element.width,
-                      element.height / 2,
-                      element.width / 2,
-                      element.height,
-                      0,
-                      element.height / 2,
-                    ]}
-                    closed
-                    fill={element.fill}
-                    stroke={element.stroke}
-                    strokeWidth={element.strokeWidth}
-                    lineJoin="round"
-                  />
-                ) : null}
-
-                {element.kind === 'image' ? <CanvasImageNode element={element} /> : null}
-
-                {element.kind === 'note' ? (
-                  <>
-                    <Rect
-                      width={element.width}
-                      height={element.height}
-                      fill={element.fill}
-                      stroke={element.stroke}
-                      strokeWidth={element.strokeWidth}
-                      cornerRadius={10}
-                    />
-                  </>
-                ) : null}
-              </Group>
+                element={element}
+                tool={tool}
+                setNodeRef={setNodeRef}
+                handlersRef={elementNodeHandlersRef}
+              />
             );
           })}
 
@@ -1282,17 +1543,6 @@ export const CanvasStage = ({
         onChange={handleImageUploadChange}
       />
 
-      <div className="note-rich-layer" aria-hidden>
-        {noteDisplayItems.map((note) => (
-          <div
-            key={note.id}
-            className="note-rich-content"
-            style={note.style}
-            dangerouslySetInnerHTML={{ __html: note.html }}
-          />
-        ))}
-      </div>
-
       {editingNote && editingNoteStyle ? (
         <div className="note-inline-editor" ref={inlineEditorRootRef} style={editingNoteStyle}>
           <div className="note-inline-toolbar">
@@ -1405,11 +1655,15 @@ export const CanvasStage = ({
         <span>
           工具: {tool} | 选择模式拖动对象，平移工具拖动画布，Ctrl/Meta + 滚轮缩放，滚轮平移，拖拽吸附（网格 {gridSnapEnabled ? '开' : '关'}，G 切换），I 或图片按钮直接插图
         </span>
+        <span>
+          Bridge: {bridgeMetrics.commandCount} cmds（+{bridgeMetrics.createCount} / ~{bridgeMetrics.updateCount} / -{bridgeMetrics.deleteCount}） | reconcile {bridgeMetrics.reconcileMs.toFixed(2)}ms / avg {bridgeMetrics.averageReconcileMs.toFixed(2)}ms / max {bridgeMetrics.maxReconcileMs.toFixed(2)}ms
+        </span>
       </div>
 
       <Minimap
-        elements={elements}
+        elements={renderElements}
         selectedIds={selectedIds}
+        renderCommands={renderCommands}
         viewport={viewport}
         stageSize={size}
         onViewportChange={onViewportChange}

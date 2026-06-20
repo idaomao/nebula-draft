@@ -1,9 +1,8 @@
 import { useEffect } from 'react';
-import type { Dispatch } from 'react';
 import type { EditorAction } from '../state/editorState';
 
 interface HotkeyOptions {
-  dispatch: Dispatch<EditorAction>;
+  dispatch: (action: EditorAction) => void;
   onCopy?: () => void;
   onPaste?: () => void;
   onSave?: () => void;
